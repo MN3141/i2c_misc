@@ -197,4 +197,11 @@ clean:
 #######################################
 -include $(wildcard $(BUILD_DIR)/*.d)
 
+flash:
+	echo "Flashing..."
+	st-flash write $(BUILD_DIR)/$(TARGET).bin 0x8000000
+
+debug:
+	echo "Debugging..."
+	gdb-multiarch $(BUILD_DIR)/$(TARGET).elf -x launch.gdb
 # *** EOF ***

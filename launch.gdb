@@ -3,3 +3,4 @@ file build/dgt.elf
 load
 b main
 c
+lay src
