@@ -115,12 +115,87 @@ void Wake_DGT3000(void)
   }
 }
 
-void SetCCMode_DGT3000(void)
+volatile uint8_t mode25_ack_received = 0;
+uint8_t mode25_ack[2];
+
+void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C2)
+  {
+    mode25_ack_received = 1;
+  }
+}
+
+int SetMode25_DGT3000(void)
+{
+  uint8_t mode25_frame[] = {
+      0x20,
+      0x06,
+      0x0B,
+      0x39,
+      0xB9};
+
+  uint8_t clock_addr = 0x08 << 1;
+
+  mode25_ack_received = 0;
+  HAL_StatusTypeDef rx_status =
+      HAL_I2C_Slave_Receive_IT(
+          &hi2c2,
+          mode25_ack,
+          sizeof(mode25_ack));
+
+  if (rx_status != HAL_OK)
+  {
+    return -1;
+  }
+
+  HAL_StatusTypeDef tx_status =
+      HAL_I2C_Master_Transmit(
+          &hi2c1,
+          clock_addr,
+          mode25_frame,
+          sizeof(mode25_frame),
+          100);
+
+  if (tx_status != HAL_OK)
+  {
+    return -2;
+  }
+
+  uint32_t start = HAL_GetTick();
+
+  while (!mode25_ack_received)
+  {
+    if ((HAL_GetTick() - start) >= 100)
+    {
+      return -3; // No ACK received
+    }
+  }
+
+  if (mode25_ack[0] != 0x0B)
+  {
+    return -4;
+  }
+
+  /*
+   */
+  if (mode25_ack[1] == 8)
+  {
+    return 0;
+  }
+
+  return -5;
+}
+
+int SetCCMode_DGT3000(void)
 {
 
+  int status = -1;
   uint8_t centralControll[] = {32, 5, 15, 72};
+  uint8_t timeout = 100;
   uint8_t clock_addr = (uint8_t)8 << 1;
   uint8_t buff[1];
+  uint8_t expectedCMD = centralControll[2];
 
   volatile HAL_StatusTypeDef tx_status = HAL_OK;
   volatile HAL_StatusTypeDef rx_status = HAL_OK;
@@ -128,22 +203,32 @@ void SetCCMode_DGT3000(void)
 
   for (int i = 0; i < attempts; i++)
   {
+    tx_status = HAL_I2C_Master_Transmit(&hi2c1, clock_addr, centralControll, sizeof(centralControll), timeout);
 
-    rx_status = HAL_I2C_Slave_Receive_IT(&hi2c2, buff, sizeof(buff));
-    tx_status = HAL_I2C_Master_Transmit_IT(&hi2c1, clock_addr, centralControll, sizeof(centralControll));
-
-    if (tx_status != HAL_OK)
+    if (tx_status == HAL_ERROR)
     {
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 1);
       Error_Handler();
     }
-
-    if (rx_status != HAL_OK)
+    else if (tx_status == HAL_BUSY)
     {
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, 1);
+      continue;
+    }
+
+    rx_status = HAL_I2C_Slave_Receive_IT(&hi2c2, buff, sizeof(buff));
+    if (rx_status == HAL_BUSY)
+    {
+      Error_Handler();
+    }
+    else if (rx_status == HAL_ERROR)
+    {
       Error_Handler();
     }
   }
+
+  if ((rx_status == HAL_OK) && (tx_status == HAL_OK))
+    status = 0;
+
+  return status;
 }
 /* USER CODE END PFP */
 
@@ -185,12 +270,43 @@ int main(void)
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   Wake_DGT3000();
+  // int cc_status = SetCCMode_DGT3000();
+  // SetCCMode_DGT3000();
+  SetMode25_DGT3000();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    volatile int status = SetMode25_DGT3000();
+
+    if (status == 0)
+    {
+      // Mode25 succeeded
+    }
+    else if (status == -1)
+    {
+      // Could not start I2C2 reception
+    }
+    else if (status == -2)
+    {
+      // Mode25 transmission failed
+    }
+    else if (status == -3)
+    {
+      // No ACK received from DGT
+    }
+    else if (status == -4)
+    {
+      // ACK command was not 0x0B
+    }
+    else if (status == -5)
+    {
+      // Negative Mode25 ACK
+    }
+
+    HAL_Delay(1000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -311,23 +427,12 @@ static void MX_I2C2_Init(void)
  */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PB0 PB1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
