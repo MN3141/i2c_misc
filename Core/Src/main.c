@@ -108,7 +108,7 @@ void Wake_DGT3000(void)
   uint8_t clock_addr = (uint8_t)40 << 1;
   volatile HAL_StatusTypeDef tx_status = HAL_OK;
 
-  for (int i = 0; i < 10; i++)
+  for (int i = 0; i < 9; i++)
   {
     tx_status = HAL_I2C_Master_Transmit(&hi2c1, clock_addr, ping_frame, sizeof(ping_frame), timeout);
     HAL_Delay(1000);
