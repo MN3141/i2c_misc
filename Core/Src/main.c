@@ -115,76 +115,49 @@ void Wake_DGT3000(void)
   }
 }
 
-volatile uint8_t mode25_ack_received = 0;
-uint8_t mode25_ack[2];
-
-void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
+HAL_StatusTypeDef SetMode25_DGT3000(void)
 {
-  if (hi2c->Instance == I2C2)
-  {
-    mode25_ack_received = 1;
-  }
-}
-
-int SetMode25_DGT3000(void)
-{
-  uint8_t mode25_frame[] = {
+  HAL_I2C_EnableListen_IT(&hi2c2); 
+  uint32_t timeout = 10; // ms
+  uint8_t mode25_frames[] = {
       0x20,
       0x06,
       0x0B,
       0x39,
       0xB9};
 
+  mode25_frames[3] = 57;
+  crc_calc(mode25_frames);
+
   uint8_t clock_addr = 0x08 << 1;
-
-  mode25_ack_received = 0;
-  HAL_StatusTypeDef rx_status =
-      HAL_I2C_Slave_Receive_IT(
-          &hi2c2,
-          mode25_ack,
-          sizeof(mode25_ack));
-
-  if (rx_status != HAL_OK)
-  {
-    return -1;
-  }
+  uint8_t rxBuffer[256];
 
   HAL_StatusTypeDef tx_status =
       HAL_I2C_Master_Transmit(
           &hi2c1,
           clock_addr,
-          mode25_frame,
-          sizeof(mode25_frame),
-          100);
+          mode25_frames,
+          sizeof(mode25_frames),
+          timeout);
 
   if (tx_status != HAL_OK)
   {
-    return -2;
+    HAL_I2C_DisableListen_IT(&hi2c2);
+    return tx_status;
   }
 
-  uint32_t start = HAL_GetTick();
-
-  while (!mode25_ack_received)
-  {
-    if ((HAL_GetTick() - start) >= 100)
-    {
-      return -3; // No ACK received
-    }
-  }
-
-  if (mode25_ack[0] != 0x0B)
-  {
-    return -4;
-  }
-
-  /*
-   */
-  if (mode25_ack[1] == 8)
+  HAL_StatusTypeDef rx_status =
+      HAL_I2C_Slave_Receive_IT(
+          &hi2c2,
+          rxBuffer,
+          sizeof(rxBuffer)
+        );
   {
     return 0;
   }
 
-  return -5;
+  HAL_I2C_DisableListen_IT(&hi2c2);
+  return 1;
 }
 
 int SetCCMode_DGT3000(void)
@@ -214,7 +187,7 @@ int SetCCMode_DGT3000(void)
       continue;
     }
 
-    rx_status = HAL_I2C_Slave_Receive_IT(&hi2c2, buff, sizeof(buff));
+    rx_status = HAL_I2C_Slave_Receive(&hi2c2, buff, sizeof(buff), 100);
     if (rx_status == HAL_BUSY)
     {
       Error_Handler();
@@ -279,32 +252,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    volatile int status = SetMode25_DGT3000();
-
-    if (status == 0)
-    {
-      // Mode25 succeeded
-    }
-    else if (status == -1)
-    {
-      // Could not start I2C2 reception
-    }
-    else if (status == -2)
-    {
-      // Mode25 transmission failed
-    }
-    else if (status == -3)
-    {
-      // No ACK received from DGT
-    }
-    else if (status == -4)
-    {
-      // ACK command was not 0x0B
-    }
-    else if (status == -5)
-    {
-      // Negative Mode25 ACK
-    }
+    volatile int status = SetCCMode_DGT3000();
 
     HAL_Delay(1000);
     /* USER CODE END WHILE */
