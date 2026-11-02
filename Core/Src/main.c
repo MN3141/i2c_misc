@@ -31,7 +31,25 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* HAL takes 8-bit (shifted) addresses, both for targets and for OwnAddress1. */
+#define DGT_CLOCK_ADDR (0x08 << 1)
+#define DGT_OWN_ADDR (0x10 << 1) /* Must match hi2c2.Init.OwnAddress1 */
 
+#define DGT_MSG_ACK 0x01
+#define DGT_CMD_CHANGE_STATE 0x0B
+#define DGT_CMD_SET_CC 0x0F
+#define DGT_ACK_POSITIVE 0x08
+
+#define DGT_TX_TIMEOUT_MS 10
+#define DGT_ACK_TIMEOUT_MS 50
+#define DGT_CONFIGURE_ATTEMPTS 6
+
+/* Same meaning as the dgtpi return codes */
+#define DGT_OK 0
+#define DGT_ERR_NEGATIVE_ACK -1 /* Clock answered, but refused the command */
+#define DGT_ERR_I2C -2          /* Bus stuck or timed out */
+#define DGT_ERR_RETRY -3        /* Collision, or no ack received */
+#define DGT_ERR_CLOCK_OFF -7    /* Address not acked, clock probably off */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,7 +62,12 @@ I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
 /* USER CODE BEGIN PV */
-const char crc_table[256] = {
+/* A frame's length is a single byte, so this can never overflow. */
+static uint8_t dgt_rx_frame[256];
+static volatile uint8_t dgt_ack_cmd;
+static volatile uint8_t dgt_ack_status;
+
+const uint8_t crc_table[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
     0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
     0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
@@ -85,19 +108,16 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
-char crc_calc(char *buffer)
+/* The CRC also covers the destination address byte, which is not part of the
+   frame buffers: the HAL puts it on the wire. */
+static uint8_t DGT_Crc(uint8_t addr_byte, const uint8_t *frame, uint16_t length)
 {
-  int i;
-  char crc_result = 0;
-  char length = buffer[2] - 1;
+  uint8_t crc = crc_table[addr_byte];
 
-  for (i = 0; i < length; i++)
-    crc_result = crc_table[crc_result ^ buffer[i]]; // new CRC will be the CRC of (old CRC XORed with data byte) - see http://sbs-forum.org/marcom/dc2/20_crc-8_firmware_implementations.pdf
+  for (uint16_t i = 0; i < length; i++)
+    crc = crc_table[crc ^ frame[i]];
 
-  if (buffer[i] == crc_result)
-    return 0;
-  buffer[i] = crc_result;
-  return -1;
+  return crc;
 }
 
 void Wake_DGT3000(void)
@@ -115,93 +135,84 @@ void Wake_DGT3000(void)
   }
 }
 
-HAL_StatusTypeDef SetMode25_DGT3000(void)
+/* Send a frame to the clock and wait for the ack of its command, which the
+   clock sends to our slave address. */
+static int DGT_SendCommand(uint8_t *frame, uint16_t length, uint8_t *ack_status)
 {
-  HAL_I2C_EnableListen_IT(&hi2c2); 
-  uint32_t timeout = 10; // ms
-  uint8_t mode25_frames[] = {
-      0x20,
-      0x06,
-      0x0B,
-      0x39,
-      0xB9};
+  uint8_t cmd = frame[2];
 
-  mode25_frames[3] = 57;
-  crc_calc(mode25_frames);
+  /* Cleared before sending: the ack can arrive right after the stop condition */
+  dgt_ack_cmd = 0;
 
-  uint8_t clock_addr = 0x08 << 1;
-  uint8_t rxBuffer[256];
-
-  HAL_StatusTypeDef tx_status =
-      HAL_I2C_Master_Transmit(
-          &hi2c1,
-          clock_addr,
-          mode25_frames,
-          sizeof(mode25_frames),
-          timeout);
-
-  if (tx_status != HAL_OK)
+  if (HAL_I2C_Master_Transmit(&hi2c1, DGT_CLOCK_ADDR, frame, length, DGT_TX_TIMEOUT_MS) != HAL_OK)
   {
-    HAL_I2C_DisableListen_IT(&hi2c2);
-    return tx_status;
+    /* HAL only checks ARLO in IT mode, here it shows up as a timeout */
+    if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_ARLO))
+    {
+      __HAL_I2C_CLEAR_FLAG(&hi2c1, I2C_FLAG_ARLO);
+      return DGT_ERR_RETRY;
+    }
+    if (HAL_I2C_GetError(&hi2c1) & HAL_I2C_ERROR_AF)
+      return DGT_ERR_CLOCK_OFF;
+    return DGT_ERR_I2C;
   }
 
-  HAL_StatusTypeDef rx_status =
-      HAL_I2C_Slave_Receive_IT(
-          &hi2c2,
-          rxBuffer,
-          sizeof(rxBuffer)
-        );
+  uint32_t start = HAL_GetTick();
+  while (dgt_ack_cmd != cmd)
   {
-    return 0;
+    if (HAL_GetTick() - start >= DGT_ACK_TIMEOUT_MS)
+      return DGT_ERR_RETRY;
   }
 
-  HAL_I2C_DisableListen_IT(&hi2c2);
-  return 1;
+  *ack_status = dgt_ack_status;
+  return DGT_OK;
 }
 
+/* Returns DGT_ERR_NEGATIVE_ACK if the clock is not in central control. */
+int SetMode25_DGT3000(void)
+{
+  uint8_t mode25_frame[] = {0x20, 0x06, DGT_CMD_CHANGE_STATE, 0x39, 0xB9};
+  uint8_t status = 0;
+
+  int e = DGT_SendCommand(mode25_frame, sizeof(mode25_frame), &status);
+  if (e != DGT_OK)
+    return e;
+
+  return (status == DGT_ACK_POSITIVE) ? DGT_OK : DGT_ERR_NEGATIVE_ACK;
+}
+
+/* Returns DGT_ERR_NEGATIVE_ACK if the clock refuses, e.g. because it is running. */
 int SetCCMode_DGT3000(void)
 {
+  uint8_t central_control_frame[] = {0x20, 0x05, DGT_CMD_SET_CC, 0x48};
+  uint8_t status = 0;
 
-  int status = -1;
-  uint8_t centralControll[] = {32, 5, 15, 72};
-  uint8_t timeout = 100;
-  uint8_t clock_addr = (uint8_t)8 << 1;
-  uint8_t buff[1];
-  uint8_t expectedCMD = centralControll[2];
+  int e = DGT_SendCommand(central_control_frame, sizeof(central_control_frame), &status);
+  if (e != DGT_OK)
+    return e;
 
-  volatile HAL_StatusTypeDef tx_status = HAL_OK;
-  volatile HAL_StatusTypeDef rx_status = HAL_OK;
-  int attempts = 3;
+  return (status & DGT_ACK_POSITIVE) ? DGT_OK : DGT_ERR_NEGATIVE_ACK;
+}
 
-  for (int i = 0; i < attempts; i++)
+/* Get the clock into mode 25, as dgt3000Configure() does: mode 25 is tried
+   first, central control is only needed when the clock refuses it. */
+int Configure_DGT3000(void)
+{
+  int e = DGT_ERR_I2C;
+
+  for (int i = 0; i < DGT_CONFIGURE_ATTEMPTS; i++)
   {
-    tx_status = HAL_I2C_Master_Transmit(&hi2c1, clock_addr, centralControll, sizeof(centralControll), timeout);
+    e = SetMode25_DGT3000();
+    if (e == DGT_OK)
+      return DGT_OK;
 
-    if (tx_status == HAL_ERROR)
-    {
-      Error_Handler();
-    }
-    else if (tx_status == HAL_BUSY)
-    {
-      continue;
-    }
-
-    rx_status = HAL_I2C_Slave_Receive(&hi2c2, buff, sizeof(buff), 100);
-    if (rx_status == HAL_BUSY)
-    {
-      Error_Handler();
-    }
-    else if (rx_status == HAL_ERROR)
-    {
-      Error_Handler();
-    }
+    if (e == DGT_ERR_NEGATIVE_ACK)
+      SetCCMode_DGT3000();
+    else if (e == DGT_ERR_CLOCK_OFF)
+      Wake_DGT3000();
   }
 
-  if ((rx_status == HAL_OK) && (tx_status == HAL_OK))
-    status = 0;
-
-  return status;
+  return e;
 }
 /* USER CODE END PFP */
 
@@ -242,18 +253,21 @@ int main(void)
   MX_I2C1_Init();
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
+  /* Listen before sending anything, the clock answers as soon as a frame ends */
+  if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   Wake_DGT3000();
-  // int cc_status = SetCCMode_DGT3000();
-  // SetCCMode_DGT3000();
-  SetMode25_DGT3000();
+  volatile int status = Configure_DGT3000();
+  (void)status;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    volatile int status = SetCCMode_DGT3000();
-
     HAL_Delay(1000);
     /* USER CODE END WHILE */
 
@@ -353,11 +367,11 @@ static void MX_I2C2_Init(void)
   hi2c2.Instance = I2C2;
   hi2c2.Init.ClockSpeed = 100000;
   hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c2.Init.OwnAddress1 = 16;
+  hi2c2.Init.OwnAddress1 = 32;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c2.Init.OwnAddress2 = 0;
-  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_ENABLE;
   hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
   if (HAL_I2C_Init(&hi2c2) != HAL_OK)
   {
@@ -388,7 +402,36 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, uint16_t AddrMatchCode)
+{
+  UNUSED(AddrMatchCode);
 
+  if (hi2c == &hi2c2 && TransferDirection == I2C_DIRECTION_TRANSMIT)
+  {
+    HAL_I2C_Slave_Seq_Receive_IT(hi2c, dgt_rx_frame, sizeof(dgt_rx_frame), I2C_LAST_FRAME);
+  }
+}
+
+/* The frame length is not known up front, so the receive buffer is never filled
+   and the HAL ends each frame at the stop condition, reporting it as an
+   incomplete transfer. That also ends the listen mode, so restart it here. */
+void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c != &hi2c2)
+    return;
+
+  /* Ack frame: source, length (counts the address byte), type, command, status,
+     ..., crc. Broadcasts have another CRC seed, so they are dropped here. */
+  uint16_t received = hi2c->XferSize - hi2c->XferCount;
+  if (received >= 6 && dgt_rx_frame[1] == received + 1 && dgt_rx_frame[2] == DGT_MSG_ACK &&
+      DGT_Crc(DGT_OWN_ADDR, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1])
+  {
+    dgt_ack_status = dgt_rx_frame[4];
+    dgt_ack_cmd = dgt_rx_frame[3];
+  }
+
+  HAL_I2C_EnableListen_IT(hi2c);
+}
 /* USER CODE END 4 */
 
 /**
