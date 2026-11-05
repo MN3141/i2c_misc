@@ -36,6 +36,8 @@
 #define DGT_OWN_ADDR (0x10 << 1) /* Must match hi2c2.Init.OwnAddress1 */
 
 #define DGT_MSG_ACK 0x01
+#define DGT_CMD_DISPLAY 0x06
+#define DGT_CMD_END_DISPLAY 0x07
 #define DGT_CMD_CHANGE_STATE 0x0B
 #define DGT_CMD_SET_CC 0x0F
 #define DGT_ACK_POSITIVE 0x08
@@ -43,6 +45,10 @@
 #define DGT_TX_TIMEOUT_MS 10
 #define DGT_ACK_TIMEOUT_MS 50
 #define DGT_CONFIGURE_ATTEMPTS 6
+#define DGT_DISPLAY_ATTEMPTS 3
+#define DGT_BUS_QUIET_US 100         /* bus must be idle this long before sending */
+#define DGT_BUS_FREE_TIMEOUT_US 10000 /* as dgtpi: bus should be free in 10ms */
+#define DGT_DISPLAY_CHARS 11
 
 /* Same meaning as the dgtpi return codes */
 #define DGT_OK 0
@@ -66,6 +72,26 @@ I2C_HandleTypeDef hi2c2;
 static uint8_t dgt_rx_frame[256];
 static volatile uint8_t dgt_ack_cmd;
 static volatile uint8_t dgt_ack_status;
+
+/* Debug log, read it in gdb: p dgt_dbg_steps / p/x dgt_dbg_rx */
+#define DGT_DBG_STEPS 16
+#define DGT_DBG_RX 16
+typedef struct
+{
+  uint8_t step; /* the command byte that was sent */
+  int8_t result;
+  uint8_t status;
+} dgt_dbg_step_t;
+typedef struct
+{
+  uint8_t len;
+  uint8_t crc_seed; /* 0x20 = own address, 0x00 = broadcast, 0xFF = bad crc */
+  uint8_t data[22];
+} dgt_dbg_rx_t;
+volatile dgt_dbg_step_t dgt_dbg_steps[DGT_DBG_STEPS];
+volatile uint8_t dgt_dbg_step_count;
+volatile dgt_dbg_rx_t dgt_dbg_rx[DGT_DBG_RX];
+volatile uint8_t dgt_dbg_rx_count;
 
 const uint8_t crc_table[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
@@ -137,9 +163,54 @@ void Wake_DGT3000(void)
 
 /* Send a frame to the clock and wait for the ack of its command, which the
    clock sends to our slave address. */
+static int DGT_SendCommandRaw(uint8_t *frame, uint16_t length, uint8_t *ack_status);
+
 static int DGT_SendCommand(uint8_t *frame, uint16_t length, uint8_t *ack_status)
 {
+  int e = DGT_SendCommandRaw(frame, length, ack_status);
+
+  uint8_t n = dgt_dbg_step_count;
+  if (n < DGT_DBG_STEPS)
+  {
+    dgt_dbg_steps[n].step = frame[2];
+    dgt_dbg_steps[n].result = (int8_t)e;
+    dgt_dbg_steps[n].status = (e == DGT_OK) ? *ack_status : 0;
+    dgt_dbg_step_count = n + 1;
+  }
+  return e;
+}
+
+/* Nobody is talking: no start seen on the bus and our slave is not receiving. */
+static int DGT_BusIdle(void)
+{
+  return !__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY) && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN;
+}
+
+/* As i2cSend() in dgtpi: the clock sends its queued messages ~50us after the
+   previous one, so only start once the bus has been idle for a while. */
+static int DGT_WaitBusFree(void)
+{
+  const uint32_t quiet = DGT_BUS_QUIET_US * (SystemCoreClock / 1000000U);
+  const uint32_t limit = DGT_BUS_FREE_TIMEOUT_US * (SystemCoreClock / 1000000U);
+  uint32_t start = DWT->CYCCNT;
+  uint32_t idle_since = start;
+
+  while (DWT->CYCCNT - idle_since < quiet)
+  {
+    if (!DGT_BusIdle())
+      idle_since = DWT->CYCCNT;
+    if (DWT->CYCCNT - start > limit)
+      return DGT_ERR_I2C;
+  }
+  return DGT_OK;
+}
+
+static int DGT_SendCommandRaw(uint8_t *frame, uint16_t length, uint8_t *ack_status)
+{
   uint8_t cmd = frame[2];
+
+  if (DGT_WaitBusFree() != DGT_OK)
+    return DGT_ERR_I2C;
 
   /* Cleared before sending: the ack can arrive right after the stop condition */
   dgt_ack_cmd = 0;
@@ -153,7 +224,11 @@ static int DGT_SendCommand(uint8_t *frame, uint16_t length, uint8_t *ack_status)
       return DGT_ERR_RETRY;
     }
     if (HAL_I2C_GetError(&hi2c1) & HAL_I2C_ERROR_AF)
-      return DGT_ERR_CLOCK_OFF;
+    {
+      /* Not acked while the clock is talking: a collision, not a clock that is
+         off, same as dgtpi */
+      return DGT_BusIdle() ? DGT_ERR_CLOCK_OFF : DGT_ERR_RETRY;
+    }
     return DGT_ERR_I2C;
   }
 
@@ -168,6 +243,72 @@ static int DGT_SendCommand(uint8_t *frame, uint16_t length, uint8_t *ack_status)
   return DGT_OK;
 }
 
+/* Clear the display, as dgt3000EndDisplay() does. The clock answers either
+   right away to our address (status 5: already empty) or with a broadcast
+   once the display is cleared (status 0). */
+int EndDisplay_DGT3000(void)
+{
+  uint8_t end_display_frame[] = {0x20, 0x05, DGT_CMD_END_DISPLAY, 0x70};
+  uint8_t status = 0;
+
+  int e = DGT_SendCommand(end_display_frame, sizeof(end_display_frame), &status);
+  if (e != DGT_OK)
+    return e;
+
+  status &= 0x07;
+  return (status == 0x05 || status == 0x00) ? DGT_OK : DGT_ERR_NEGATIVE_ACK;
+}
+
+/* Show text (up to 11 characters, padded with spaces) as dgt3000SetDisplay()
+   does. The ack is a broadcast. */
+int SetDisplay_DGT3000(const char *text, uint8_t beep, uint8_t left_dots, uint8_t right_dots)
+{
+  /* source, length, command, 11 characters, 0xFF, beep, 0x03, left dots,
+     right dots, crc */
+  uint8_t display_frame[] = {0x20, 0x15, DGT_CMD_DISPLAY,
+                             ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+                             0xFF, 0x00, 0x03, 0x00, 0x00, 0x00};
+  uint8_t status = 0;
+
+  for (int i = 0; i < DGT_DISPLAY_CHARS && text[i] != '\0'; i++)
+    display_frame[3 + i] = (uint8_t)text[i];
+
+  display_frame[15] = beep;
+  display_frame[17] = left_dots;
+  display_frame[18] = right_dots;
+  display_frame[19] = DGT_Crc(DGT_CLOCK_ADDR, display_frame, sizeof(display_frame) - 1);
+
+  int e = DGT_SendCommand(display_frame, sizeof(display_frame), &status);
+  if (e != DGT_OK)
+    return e;
+
+  /* Refused: a message is already being displayed */
+  return ((status & 0xF3) == 0x23) ? DGT_ERR_NEGATIVE_ACK : DGT_OK;
+}
+
+/* Clear the display and then show the text, three attempts each, as
+   dgt3000Display() does. */
+int Display_DGT3000(const char *text, uint8_t beep, uint8_t left_dots, uint8_t right_dots)
+{
+  int e = DGT_ERR_I2C;
+
+  for (int i = 0; i < DGT_DISPLAY_ATTEMPTS; i++)
+  {
+    e = EndDisplay_DGT3000();
+    if (e == DGT_OK)
+      break;
+  }
+  if (e != DGT_OK)
+    return e;
+
+  for (int i = 0; i < DGT_DISPLAY_ATTEMPTS; i++)
+  {
+    e = SetDisplay_DGT3000(text, beep, left_dots, right_dots);
+    if (e == DGT_OK)
+      break;
+  }
+  return e;
+}
 /* Returns DGT_ERR_NEGATIVE_ACK if the clock is not in central control. */
 int SetMode25_DGT3000(void)
 {
@@ -180,6 +321,7 @@ int SetMode25_DGT3000(void)
 
   return (status == DGT_ACK_POSITIVE) ? DGT_OK : DGT_ERR_NEGATIVE_ACK;
 }
+
 
 /* Returns DGT_ERR_NEGATIVE_ACK if the clock refuses, e.g. because it is running. */
 int SetCCMode_DGT3000(void)
@@ -253,6 +395,11 @@ int main(void)
   MX_I2C1_Init();
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
+  /* Cycle counter, used to time the bus idle gap before sending */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
   /* Listen before sending anything, the clock answers as soon as a frame ends */
   if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK)
   {
@@ -260,8 +407,13 @@ int main(void)
   }
 
   Wake_DGT3000();
-  volatile int status = Configure_DGT3000();
-  (void)status;
+  /* Like dgtpi, try the display even if configuring reported a failure */
+  volatile int configure_status = Configure_DGT3000();
+  volatile int display_status = Display_DGT3000("2003", 0, 0, 0);
+  HAL_Delay(2000);
+  Display_DGT3000(" 1999",0,0,0);
+  (void)configure_status;
+  (void)display_status;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -274,6 +426,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
+
 }
 
 /**
@@ -421,10 +574,28 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c)
     return;
 
   /* Ack frame: source, length (counts the address byte), type, command, status,
-     ..., crc. Broadcasts have another CRC seed, so they are dropped here. */
+     ..., crc. The CRC is seeded with the address the frame was sent to: ours,
+     or 0x00 for broadcasts (general call), which the display acks use. */
   uint16_t received = hi2c->XferSize - hi2c->XferCount;
+
+  uint8_t n = dgt_dbg_rx_count;
+  if (n < DGT_DBG_RX && received > 0)
+  {
+    uint8_t seed = 0xFF;
+    if (DGT_Crc(DGT_OWN_ADDR, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1])
+      seed = DGT_OWN_ADDR;
+    else if (DGT_Crc(0x00, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1])
+      seed = 0x00;
+    dgt_dbg_rx[n].len = (uint8_t)received;
+    dgt_dbg_rx[n].crc_seed = seed;
+    for (uint16_t i = 0; i < received && i < sizeof(dgt_dbg_rx[n].data); i++)
+      dgt_dbg_rx[n].data[i] = dgt_rx_frame[i];
+    dgt_dbg_rx_count = n + 1;
+  }
+
   if (received >= 6 && dgt_rx_frame[1] == received + 1 && dgt_rx_frame[2] == DGT_MSG_ACK &&
-      DGT_Crc(DGT_OWN_ADDR, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1])
+      (DGT_Crc(DGT_OWN_ADDR, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1] ||
+       DGT_Crc(0x00, dgt_rx_frame, received - 1) == dgt_rx_frame[received - 1]))
   {
     dgt_ack_status = dgt_rx_frame[4];
     dgt_ack_cmd = dgt_rx_frame[3];
