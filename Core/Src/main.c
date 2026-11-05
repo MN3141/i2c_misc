@@ -46,8 +46,10 @@
 #define DGT_ACK_TIMEOUT_MS 50
 #define DGT_CONFIGURE_ATTEMPTS 6
 #define DGT_DISPLAY_ATTEMPTS 3
-#define DGT_BUS_QUIET_US 100         /* bus must be idle this long before sending */
-#define DGT_BUS_FREE_TIMEOUT_US 10000 /* as dgtpi: bus should be free in 10ms */
+/* As DGT3000-BLE-Gateway: the clock sends its queued messages right after the
+   previous one, so give it time before sending, and more after a failure. */
+#define DGT_COMMAND_DELAY_MS 25
+#define DGT_RETRY_DELAY_MS 100
 #define DGT_DISPLAY_CHARS 11
 
 /* Same meaning as the dgtpi return codes */
@@ -163,54 +165,11 @@ void Wake_DGT3000(void)
 
 /* Send a frame to the clock and wait for the ack of its command, which the
    clock sends to our slave address. */
-static int DGT_SendCommandRaw(uint8_t *frame, uint16_t length, uint8_t *ack_status);
-
 static int DGT_SendCommand(uint8_t *frame, uint16_t length, uint8_t *ack_status)
-{
-  int e = DGT_SendCommandRaw(frame, length, ack_status);
-
-  uint8_t n = dgt_dbg_step_count;
-  if (n < DGT_DBG_STEPS)
-  {
-    dgt_dbg_steps[n].step = frame[2];
-    dgt_dbg_steps[n].result = (int8_t)e;
-    dgt_dbg_steps[n].status = (e == DGT_OK) ? *ack_status : 0;
-    dgt_dbg_step_count = n + 1;
-  }
-  return e;
-}
-
-/* Nobody is talking: no start seen on the bus and our slave is not receiving. */
-static int DGT_BusIdle(void)
-{
-  return !__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY) && HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN;
-}
-
-/* As i2cSend() in dgtpi: the clock sends its queued messages ~50us after the
-   previous one, so only start once the bus has been idle for a while. */
-static int DGT_WaitBusFree(void)
-{
-  const uint32_t quiet = DGT_BUS_QUIET_US * (SystemCoreClock / 1000000U);
-  const uint32_t limit = DGT_BUS_FREE_TIMEOUT_US * (SystemCoreClock / 1000000U);
-  uint32_t start = DWT->CYCCNT;
-  uint32_t idle_since = start;
-
-  while (DWT->CYCCNT - idle_since < quiet)
-  {
-    if (!DGT_BusIdle())
-      idle_since = DWT->CYCCNT;
-    if (DWT->CYCCNT - start > limit)
-      return DGT_ERR_I2C;
-  }
-  return DGT_OK;
-}
-
-static int DGT_SendCommandRaw(uint8_t *frame, uint16_t length, uint8_t *ack_status)
 {
   uint8_t cmd = frame[2];
 
-  if (DGT_WaitBusFree() != DGT_OK)
-    return DGT_ERR_I2C;
+  HAL_Delay(DGT_COMMAND_DELAY_MS);
 
   /* Cleared before sending: the ack can arrive right after the stop condition */
   dgt_ack_cmd = 0;
@@ -224,11 +183,7 @@ static int DGT_SendCommandRaw(uint8_t *frame, uint16_t length, uint8_t *ack_stat
       return DGT_ERR_RETRY;
     }
     if (HAL_I2C_GetError(&hi2c1) & HAL_I2C_ERROR_AF)
-    {
-      /* Not acked while the clock is talking: a collision, not a clock that is
-         off, same as dgtpi */
-      return DGT_BusIdle() ? DGT_ERR_CLOCK_OFF : DGT_ERR_RETRY;
-    }
+      return DGT_ERR_CLOCK_OFF;
     return DGT_ERR_I2C;
   }
 
@@ -287,13 +242,15 @@ int SetDisplay_DGT3000(const char *text, uint8_t beep, uint8_t left_dots, uint8_
 }
 
 /* Clear the display and then show the text, three attempts each, as
-   dgt3000Display() does. */
+   dgt3000Display() does, with a pause before each retry. */
 int Display_DGT3000(const char *text, uint8_t beep, uint8_t left_dots, uint8_t right_dots)
 {
   int e = DGT_ERR_I2C;
 
   for (int i = 0; i < DGT_DISPLAY_ATTEMPTS; i++)
   {
+    if (i > 0)
+      HAL_Delay(DGT_RETRY_DELAY_MS);
     e = EndDisplay_DGT3000();
     if (e == DGT_OK)
       break;
@@ -303,6 +260,8 @@ int Display_DGT3000(const char *text, uint8_t beep, uint8_t left_dots, uint8_t r
 
   for (int i = 0; i < DGT_DISPLAY_ATTEMPTS; i++)
   {
+    if (i > 0)
+      HAL_Delay(DGT_RETRY_DELAY_MS);
     e = SetDisplay_DGT3000(text, beep, left_dots, right_dots);
     if (e == DGT_OK)
       break;
@@ -344,6 +303,8 @@ int Configure_DGT3000(void)
 
   for (int i = 0; i < DGT_CONFIGURE_ATTEMPTS; i++)
   {
+    if (i > 0)
+      HAL_Delay(DGT_RETRY_DELAY_MS);
     e = SetMode25_DGT3000();
     if (e == DGT_OK)
       return DGT_OK;
@@ -395,11 +356,6 @@ int main(void)
   MX_I2C1_Init();
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
-  /* Cycle counter, used to time the bus idle gap before sending */
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-
   /* Listen before sending anything, the clock answers as soon as a frame ends */
   if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK)
   {
@@ -409,9 +365,13 @@ int main(void)
   Wake_DGT3000();
   /* Like dgtpi, try the display even if configuring reported a failure */
   volatile int configure_status = Configure_DGT3000();
-  volatile int display_status = Display_DGT3000("2003", 0, 0, 0);
-  HAL_Delay(2000);
-  Display_DGT3000(" 1999",0,0,0);
+  volatile int display_status = Display_DGT3000("1999", 0, 0, 0);
+  HAL_Delay(1000);
+  Display_DGT3000(" 2000",0,0,0);
+  HAL_Delay(1000);
+  Display_DGT3000("  2001",0,0,0);
+  HAL_Delay(1000);
+  Display_DGT3000("   2002",0,0,0);
   (void)configure_status;
   (void)display_status;
   /* USER CODE END 2 */
